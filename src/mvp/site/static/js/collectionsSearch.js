@@ -20,8 +20,10 @@ function collectionsSearch(inputId, resultsId, spinnerId) {
             const a = document.createElement('a');
             a.href = entry.url;
             a.className = 'link block px-3 py-1.5 text-sm hover:bg-neutral-100';
+
             var label = entry.title + ' (' + entry.language + ')';
             if (entry.author) label += ' — ' + entry.author;
+            if (entry.editors) label += " — " + entry.editors;
             a.textContent = label;
             li.appendChild(a);
             list.appendChild(li);
