@@ -1,2 +1,2 @@
-{%- set tagname = text_container.subtype or text_container.tagname -%}
+{%- set tagname = text_container.tagname -%}
 {%- include ["text_elements/" + tagname + ".html.jinja", "text_elements/span.html.jinja"] -%}

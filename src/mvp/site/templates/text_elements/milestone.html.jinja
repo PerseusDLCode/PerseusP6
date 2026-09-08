@@ -1,4 +1,13 @@
-{% if text_container.n %}
+{% set is_strophic = text_container.unit in ("antistrophe", "epode", "strophe") %}
+{% if is_strophic %}
+    <div class="relative pt-4">
+        <div class="absolute right-8 select-none text-base-content/50 text-sm opacity-50">
+            {% if text_container.subtype == "epode" %}ep.{% else %}{{ text_container.subtype }}{% endif %}
+            {{ text_container.n }}
+        </div>
+    </div>
+{% endif %}
+{% if text_container.n and not is_strophic and not (text_container.unit == "page" and text_container.resp == "Stephanus") %}
     {%- set id = text_container.unit + "-" + text_container.get("n", "") -%}<span id="{{ id }}"
       data-n="{{ text_container.get('n', '') }}"
       data-unit="{{ text_container.unit }}"
