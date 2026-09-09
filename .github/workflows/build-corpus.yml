@@ -121,12 +121,12 @@ jobs:
           # repository"), unlike image *tags*, which do allow it.
           - name: greekLit
             tag_name: greeklit
-            repo_url: https://github.com/PerseusDLCode/canonical-greekLit
-            branch: dev
+            repo_url: https://github.com/PerseusDL/canonical-greekLit
+            branch: master
           - name: latinLit
             tag_name: latinlit
-            repo_url: https://github.com/PerseusDLCode/canonical-latinLit
-            branch: dev
+            repo_url: https://github.com/PerseusDL/canonical-latinLit
+            branch: master
           # NOTE: this corpus's own __cts__.xml files declare "hebrewLit"
           # (see _CORPUS_LABELS/_CORPUS_REPO in app.py), but the directory
           # name actually used at runtime — and so the "corpus" _discover_
