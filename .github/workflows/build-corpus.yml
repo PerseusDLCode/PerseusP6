@@ -332,3 +332,32 @@ jobs:
           ALIAS="${{ github.ref_name == 'main' && 'latest' || 'staging' }}"
           oras tag "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}:${{ needs.resolve-corpora-shas.outputs.combined }}" "$ALIAS"
           oras tag "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}-manifest:${{ needs.resolve-corpora-shas.outputs.combined }}" "$ALIAS"
+
+  # Publishes SHARD_COUNT as its own tiny artifact so cron-deploy.sh can
+  # verify each deploy host's SHARDS matches it before deploying — without
+  # this, bumping SHARD_COUNT above without updating every deploy host's
+  # SHARDS would silently deploy a site missing whichever shards that host
+  # never fetches. Runs once per workflow run (not once per matrix leg,
+  # unlike the per-shard alias tag above), and only after every leg of
+  # `build` has succeeded — if a leg fails, the previous count stays
+  # published rather than getting overwritten with an unverified one.
+  publish-shard-count:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v2
+
+      - name: Push shard count
+        run: |
+          ALIAS="${{ github.ref_name == 'main' && 'latest' || 'staging' }}"
+          printf '%s' "${{ env.SHARD_COUNT }}" > shard-count.txt
+          oras push "ghcr.io/perseusdlcode/mvp-shard-count:${ALIAS}" \
+            shard-count.txt:text/plain

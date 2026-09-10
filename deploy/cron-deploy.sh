@@ -37,9 +37,11 @@
 # BUILD_DIR symlink pointing at whichever is currently served. Each run that
 # detects a changed artifact fully repopulates the *inactive* directory from
 # scratch (not an in-place patch — simpler and safer than reconciling
-# per-corpus deletions) and, on success, flips the symlink and force-recreates
-# `serve`. On failure, nothing is touched — the live symlink still points at
-# the last-good build, so there is no restore step.
+# per-corpus deletions), validates it, and only then flips the symlink and
+# force-recreates `serve`. On any failure — an unresolvable digest, a SHARDS
+# mismatch against what CI published, or a validation failure on the freshly
+# repopulated inactive slot — nothing is touched: the live symlink still
+# points at the last-good build, so there is no restore step.
 #
 # Intended to run under `flock` every 10 minutes:
 #   */10 * * * * /usr/bin/flock -n /home/perseus/deploy.lock /home/perseus/MinimumViablePerseus/deploy/cron-deploy.sh >> /home/perseus/deploy.log 2>&1
@@ -92,6 +94,31 @@ mkdir -p "$STATE_DIR"
 if [ -n "${GHCR_TOKEN:-}" ] && [ -n "${GHCR_USER:-}" ]; then
   echo "$GHCR_TOKEN" | "$ORAS_BIN" login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 fi
+
+# ----- Sanity-check SHARDS against what CI actually published --------------
+# SHARDS must equal build-corpus.yml's SHARD_COUNT (0..SHARD_COUNT-1) — CI
+# publishes that count as its own tiny artifact precisely so a mismatch
+# (e.g. SHARD_COUNT bumped in CI without updating every deploy host's
+# SHARDS) is caught loudly here, instead of this host silently serving a
+# site that's missing whichever shards it never fetches.
+COUNT_TMP="$(mktemp -d)"
+if "$ORAS_BIN" pull "${REGISTRY}/mvp-shard-count:${TAG}" -o "$COUNT_TMP" >/dev/null 2>&1; then
+  EXPECTED_SHARD_COUNT="$(cat "${COUNT_TMP}/shard-count.txt")"
+  # Not `wc -w`: it pads its output with leading whitespace (e.g. "   5"),
+  # which would never string-match EXPECTED_SHARD_COUNT's unpadded digits.
+  read -ra SHARD_ARR <<< "$SHARDS"
+  ACTUAL_SHARD_COUNT="${#SHARD_ARR[@]}"
+  if [ "$EXPECTED_SHARD_COUNT" != "$ACTUAL_SHARD_COUNT" ]; then
+    rm -rf "$COUNT_TMP"
+    echo "ERROR: SHARDS lists ${ACTUAL_SHARD_COUNT} shard(s) but CI published" \
+         "${EXPECTED_SHARD_COUNT} for :${TAG} — update SHARDS (this host's" \
+         ".env) to match build-corpus.yml's SHARD_COUNT before deploying." >&2
+    exit 1
+  fi
+else
+  log "WARN: could not resolve mvp-shard-count:${TAG}; skipping SHARDS sanity check."
+fi
+rm -rf "$COUNT_TMP"
 
 # ----- Ensure blue-green layout exists ---------------------------------
 mkdir -p "$BUILD_A" "$BUILD_B"
@@ -167,7 +194,13 @@ PULL_TMP="$(mktemp -d)"
 trap 'rm -rf "$PULL_TMP"' EXIT
 
 for shard in $SHARDS; do
-  ref="${REGISTRY}/mvp-shard-${shard}:${TAG}"
+  name="shard-${shard}"
+  # Pull by the digest resolved in step 1, not by "$TAG" again: the mutable
+  # tag can move between that resolution and this pull (CI can push at any
+  # time), which would otherwise extract content newer than what gets
+  # recorded to STATE_DIR — silently desyncing "what's live" from "what we
+  # think is live" until the next unrelated change papers over it.
+  ref="${REGISTRY}/mvp-shard-${shard}@${NEW_DIGEST[$name]}"
   log "Pulling ${ref}..."
   "$ORAS_BIN" pull "$ref" -o "${PULL_TMP}/shard-${shard}"
   tar --zstd -xf "${PULL_TMP}/shard-${shard}/pages.tar.zst" -C "$INACTIVE_DIR"
@@ -179,12 +212,36 @@ for shard in $SHARDS; do
   rm -rf "${PULL_TMP:?}/shard-${shard}"
 done
 
-log "Pulling ${REGISTRY}/mvp-global:${TAG}..."
-"$ORAS_BIN" pull "${REGISTRY}/mvp-global:${TAG}" -o "${PULL_TMP}/global"
+GLOBAL_REF="${REGISTRY}/mvp-global@${NEW_DIGEST[global]}"
+log "Pulling ${GLOBAL_REF}..."
+"$ORAS_BIN" pull "$GLOBAL_REF" -o "${PULL_TMP}/global"
 tar --zstd -xf "${PULL_TMP}/global/global.tar.zst" -C "$INACTIVE_DIR"
 rm -rf "${PULL_TMP:?}/global"
 
-# ----- 3. Flip symlink, restart serve, write state --------------------------
+# ----- 3. Validate before flipping traffic to it -----------------------------
+# A best-effort content sanity check, not a full smoke test (the inactive
+# slot isn't served yet, so it can't be curl'd) — catches an obviously
+# corrupt/partial pull (missing global index, or a shard silently truncated)
+# before it goes live, rather than only after users notice.
+log "Validating ${INACTIVE_DIR} before flipping traffic..."
+if [ ! -f "${INACTIVE_DIR}/index.html" ]; then
+  log "ERROR: ${INACTIVE_DIR}/index.html missing after extraction — refusing to flip traffic to it."
+  exit 1
+fi
+
+NEW_FILE_COUNT="$(find "$INACTIVE_DIR" -type f | wc -l)"
+OLD_FILE_COUNT=0
+[ -d "$ACTIVE_REAL" ] && OLD_FILE_COUNT="$(find "$ACTIVE_REAL" -type f | wc -l)"
+# A from-scratch rebuild landing at less than half the currently-live file
+# count almost certainly means a corrupt/partial pull, not a real shrink of
+# the corpus — refuse to serve it rather than regressing the live site.
+if [ "$OLD_FILE_COUNT" -gt 0 ] && [ "$NEW_FILE_COUNT" -lt $((OLD_FILE_COUNT / 2)) ]; then
+  log "ERROR: ${INACTIVE_DIR} has ${NEW_FILE_COUNT} files, well below the" \
+      "${OLD_FILE_COUNT} currently live — refusing to flip traffic to it."
+  exit 1
+fi
+
+# ----- 4. Flip symlink, restart serve, write state --------------------------
 log "Switching ${BUILD_DIR} -> $(basename "$INACTIVE_DIR")..."
 ln -sfn "$(basename "$INACTIVE_DIR")" "$BUILD_DIR"
 
