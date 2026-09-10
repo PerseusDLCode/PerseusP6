@@ -63,22 +63,20 @@ jobs:
       - name: Install oras
         uses: oras-project/setup-oras@v1
 
-      - name: Pull each corpus's manifest
+      - name: Pull each shard's manifest
         id: manifests
         run: |
           mkdir -p manifests
           args=""
-          # name:tag_name pairs, matching build-corpus.yml's matrix — kept
-          # explicit (rather than lowercasing `name`) because some tag_names
-          # aren't just a lowercased name (e.g. Notre-Dame-Digitized-Latin-
-          # Collection -> nd-dlc).
-          for pair in "greekLit:greeklit" "latinLit:latinlit" "First1KGreek:first1kgreek" \
-                      "Notre-Dame-Digitized-Latin-Collection:nd-dlc" "grcnewxml:grcnewxml"; do
-            name="${pair%%:*}"
-            tag_name="${pair##*:}"
-            oras pull "ghcr.io/perseusdlcode/mvp-corpus-${tag_name}-manifest:${{ steps.ctx.outputs.alias }}" \
-              -o "manifests/${name}"
-            args="${args} --manifest manifests/${name}/manifest.json"
+          # build-corpus.yml now freezes N URL-hashed shards rather than one
+          # leg per corpus (see that workflow's header comment) -- every
+          # shard's manifest already covers every corpus's collections
+          # (each shard's CORPORA_DIR holds all of them), so these five are
+          # redundant with each other and get deduped by _merge_manifests.
+          for shard in 0 1 2 3 4; do
+            oras pull "ghcr.io/perseusdlcode/mvp-shard-${shard}-manifest:${{ steps.ctx.outputs.alias }}" \
+              -o "manifests/shard-${shard}"
+            args="${args} --manifest manifests/shard-${shard}/manifest.json"
           done
           echo "manifest_args=${args}" >> "$GITHUB_OUTPUT"
 

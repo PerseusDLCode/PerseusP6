@@ -337,3 +337,55 @@ class TestParseBuildArgs:
     def test_global_only_without_manifest_is_rejected(self):
         with pytest.raises(SystemExit):
             buildmod._parse_build_args(["--mode", "global-only"])
+
+    def test_corpus_only_defaults_to_a_single_unsharded_run(self):
+        args = buildmod._parse_build_args(["--mode", "corpus-only"])
+        assert args.shard_index == 0
+        assert args.shard_count == 1
+
+    def test_corpus_only_accepts_shard_flags(self):
+        args = buildmod._parse_build_args(
+            ["--mode", "corpus-only", "--shard-index", "2", "--shard-count", "5"]
+        )
+        assert args.shard_index == 2
+        assert args.shard_count == 5
+
+    def test_shard_index_out_of_range_is_rejected(self):
+        with pytest.raises(SystemExit):
+            buildmod._parse_build_args(
+                ["--mode", "corpus-only", "--shard-index", "5", "--shard-count", "5"]
+            )
+
+    def test_negative_shard_index_is_rejected(self):
+        with pytest.raises(SystemExit):
+            buildmod._parse_build_args(
+                ["--mode", "corpus-only", "--shard-index", "-1", "--shard-count", "5"]
+            )
+
+
+class TestUrlSharding:
+    """Every URL a full build would generate must land in exactly one shard,
+    regardless of which corpus namespace it belongs to (see build.py's use
+    of zlib.crc32 in build() — corpus-keyed sharding was tried and reverted
+    because these repos' namespaces overlap; see build-corpus.yml)."""
+
+    def _shard_of(self, url: str, shard_count: int) -> int:
+        import zlib
+
+        return zlib.crc32(url.encode()) % shard_count
+
+    def test_every_url_lands_in_exactly_one_shard(self):
+        urls = [
+            f"/urn:cts:greekLit:tlg0059.tlg030.perseus-grc2:{n}/" for n in range(200)
+        ]
+        shard_count = 5
+        shards: dict[int, list[str]] = {i: [] for i in range(shard_count)}
+        for url in urls:
+            shards[self._shard_of(url, shard_count)].append(url)
+
+        # Every URL assigned, none duplicated, none dropped.
+        assert sorted(u for bucket in shards.values() for u in bucket) == sorted(urls)
+
+    def test_same_url_always_hashes_to_the_same_shard(self):
+        url = "/urn:cts:greekLit:viaf107078652.viaf002.perseus-eng1:1.327A/"
+        assert self._shard_of(url, 5) == self._shard_of(url, 5)

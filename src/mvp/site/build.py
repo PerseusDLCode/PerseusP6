@@ -4,6 +4,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import zlib
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -42,12 +43,16 @@ def _parse_build_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="full",
         help=(
             "full (default): build everything from CORPORA_DIR, unchanged "
-            "from mvp-build's original behavior. corpus-only: freeze just "
-            "this corpus's reading pages plus manifest.json, skipping "
+            "from mvp-build's original behavior. corpus-only: freeze a "
+            "shard of reading pages plus manifest.json, skipping "
             "/, /collections/, /urn-index.json, /research/ — CORPORA_DIR "
-            "should point at a single corpus. global-only: skip corpus "
-            "discovery entirely and freeze just those four pages, built "
-            "from manifest.json files passed via --manifest."
+            "must contain every corpus (not just one), same as a full "
+            "local checkout, so cross-corpus sibling/commentary lookups "
+            "resolve correctly regardless of which shard a document lands "
+            "in; --shard-index/--shard-count pick which slice of the full "
+            "URL set this run actually writes to disk. global-only: skip "
+            "corpus discovery entirely and freeze just those four pages, "
+            "built from manifest.json files passed via --manifest."
         ),
     )
     parser.add_argument(
@@ -61,12 +66,30 @@ def _parse_build_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--source-digest",
         default="",
-        help="Opaque digest of this corpus's source tree, stamped into "
+        help="Opaque digest of this build's source tree, stamped into "
         "manifest.json for traceability. Only used in --mode corpus-only.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Which of --shard-count slices of the full URL set to freeze "
+        "in this run. Only used in --mode corpus-only; every other mode "
+        "freezes everything it generates. 0-indexed.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=int,
+        default=1,
+        help="How many parallel corpus-only runs are splitting the full "
+        "URL set between them (see --shard-index). 1 (default) freezes "
+        "every URL in a single run.",
     )
     args = parser.parse_args(argv)
     if args.mode == "global-only" and not args.manifest:
         parser.error("--mode global-only requires at least one --manifest PATH")
+    if not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must be in [0, --shard-count)")
     return args
 
 
@@ -254,10 +277,25 @@ def build():
     seen_endpoints: set[str] = set()
     work: list[tuple[str, Any]] = []
     for url, endpoint, last_modified in freezer._generate_all_urls():
+        # Recorded before the shard skip below so _check_endpoints (every
+        # endpoint got at least one URL somewhere) still passes per-shard —
+        # it doesn't require every URL, just that each endpoint was seen.
         seen_endpoints.add(endpoint)
         if url in seen_urls:
             continue
         seen_urls.add(url)
+        # CORPORA_DIR holds every corpus in every corpus-only run (see
+        # --mode's help), so this URL set is already the *full* site's —
+        # shard it here, by a stable hash of the URL itself, rather than by
+        # corpus: the source repos don't partition cleanly by corpus (e.g.
+        # First1KGreek declares both greekLit and hebrewlit URNs, grcnewxml
+        # declares greekLit/itaLit/latinLit), so any corpus-keyed split
+        # would either duplicate or drop pages. Hashing the URL spreads
+        # pages evenly across shards regardless of which corpus/namespace
+        # they belong to.
+        if args.shard_count > 1:
+            if zlib.crc32(url.encode()) % args.shard_count != args.shard_index:
+                continue
         work.append((url, last_modified))
 
     total = len(work)

@@ -3,19 +3,22 @@
 # cron-deploy.sh — Pull pre-built static pages from GHCR, swap them live
 #
 # Unlike the old flow, no build ever runs on this host: MinimumViablePerseus's
-# build-corpus.yml/build-global.yml (GitHub Actions) freeze each corpus's
-# pages and the four corpus-independent pages independently, and push each
-# as its own OCI artifact to GHCR. This script only pulls whichever
-# artifacts have changed and extracts them into the currently-inactive
-# blue-green directory — no CPU-heavy work happens here at all.
+# build-corpus.yml/build-global.yml (GitHub Actions) freeze the site's pages
+# in N parallel URL-hashed shards (each shard covering every corpus, not
+# one corpus each — see build-corpus.yml's header comment) plus the four
+# corpus-independent pages, and push each as its own OCI artifact to GHCR.
+# This script only pulls whichever artifacts have changed and extracts them
+# into the currently-inactive blue-green directory — no CPU-heavy work
+# happens here at all. Shards are disjoint (each page is written by exactly
+# one shard), so the extraction order below no longer matters the way an
+# overlapping per-corpus split once did.
 #
 # Environment variables (set these in ENV_FILE or crontab):
 #   REGISTRY        GHCR namespace holding the artifacts
 #                    (default: ghcr.io/perseusdlcode)
-#   CORPORA         space-separated list of corpus tag_names to pull — must
-#                   match the lowercase tag_name values in build-corpus.yml's
-#                   matrix, not the case-sensitive corpus directory names
-#                   (default: greeklit latinlit first1kgreek nd-dlc grcnewxml)
+#   SHARDS          space-separated list of shard indices to pull — must
+#                   match build-corpus.yml's SHARD_COUNT (0-indexed)
+#                   (default: 0 1 2 3 4)
 #   ORAS_BIN        path to the oras CLI (default: oras, i.e. on PATH)
 #   BUILD_DIR       Symlink path `serve` mounts; points at whichever of the two
 #                   blue-green directories (BUILD_DIR-a / BUILD_DIR-b) is live
@@ -51,7 +54,7 @@ ENV_FILE="${ENV_FILE:-$(dirname "$0")/.env}"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 
 REGISTRY="${REGISTRY:-ghcr.io/perseusdlcode}"
-CORPORA="${CORPORA:-greeklit latinlit first1kgreek nd-dlc grcnewxml}"
+SHARDS="${SHARDS:-0 1 2 3 4}"
 # Which alias of the corpus/global artifacts to pull — main's builds tag
 # `latest` (production), dev's tag `staging` (see build-corpus.yml /
 # build-global.yml). Staging hosts set TAG=staging.
@@ -118,9 +121,9 @@ remote_digest() {
 
 ARTIFACT_NAMES=()
 ARTIFACT_REFS=()
-for corpus in $CORPORA; do
-  ARTIFACT_NAMES+=("$corpus")
-  ARTIFACT_REFS+=("${REGISTRY}/mvp-corpus-${corpus}:${TAG}")
+for shard in $SHARDS; do
+  ARTIFACT_NAMES+=("shard-${shard}")
+  ARTIFACT_REFS+=("${REGISTRY}/mvp-shard-${shard}:${TAG}")
 done
 ARTIFACT_NAMES+=("global")
 ARTIFACT_REFS+=("${REGISTRY}/mvp-global:${TAG}")
@@ -163,17 +166,17 @@ mkdir -p "${INACTIVE_DIR}"
 PULL_TMP="$(mktemp -d)"
 trap 'rm -rf "$PULL_TMP"' EXIT
 
-for corpus in $CORPORA; do
-  ref="${REGISTRY}/mvp-corpus-${corpus}:${TAG}"
+for shard in $SHARDS; do
+  ref="${REGISTRY}/mvp-shard-${shard}:${TAG}"
   log "Pulling ${ref}..."
-  "$ORAS_BIN" pull "$ref" -o "${PULL_TMP}/${corpus}"
-  tar --zstd -xf "${PULL_TMP}/${corpus}/pages.tar.zst" -C "$INACTIVE_DIR"
-  # Free this corpus's compressed artifact immediately rather than waiting
-  # for the EXIT trap — otherwise every corpus pulled so far sits fully
+  "$ORAS_BIN" pull "$ref" -o "${PULL_TMP}/shard-${shard}"
+  tar --zstd -xf "${PULL_TMP}/shard-${shard}/pages.tar.zst" -C "$INACTIVE_DIR"
+  # Free this shard's compressed artifact immediately rather than waiting
+  # for the EXIT trap — otherwise every shard pulled so far sits fully
   # resident in PULL_TMP for the rest of the run, on top of the untouched
   # (still-active) other slot and the inactive slot's own growing content,
   # which can exhaust disk well before either slot alone would.
-  rm -rf "${PULL_TMP:?}/${corpus}"
+  rm -rf "${PULL_TMP:?}/shard-${shard}"
 done
 
 log "Pulling ${REGISTRY}/mvp-global:${TAG}..."

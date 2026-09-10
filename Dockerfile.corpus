@@ -1,13 +1,21 @@
 # ================================================================
-# MinimumViablePerseus — Per-corpus builder image
+# MinimumViablePerseus — Sharded-freeze builder image
 #
-# Unlike Dockerfile (which clones all three corpora into one image for a
-# single combined build), this clones exactly one corpus, selected via
-# build-args, and its entrypoint runs `mvp-build --mode corpus-only`. Used
-# by .github/workflows/build-corpus.yml — each matrix leg builds and runs
-# its own instance of this image. The image itself is never pushed to
-# GHCR; only the frozen pages + manifest.json it writes to /app/build are
-# shipped onward (see that workflow).
+# Unlike Dockerfile (which clones all corpora into one image for a single
+# unsharded build), this also clones every corpus into one CORPORA_DIR --
+# same as Dockerfile, and same as a full local checkout -- but its
+# entrypoint runs `mvp-build --mode corpus-only --shard-index/--shard-count`,
+# writing only a slice of the full site's pages to disk. Used by
+# .github/workflows/build-corpus.yml — each matrix leg builds and runs its
+# own instance of this image with a different --shard-index, so the
+# (expensive) freeze step still runs in parallel across N runners even
+# though every runner needs the same complete CORPORA_DIR to resolve
+# cross-corpus sibling/commentary links correctly (see mvp.site.siblings —
+# a commentary's "related works" panel is looked up against whatever work
+# it's about, which often lives in a different corpus repo than the
+# commentary itself). The image itself is never pushed to GHCR; only the
+# frozen pages + manifest.json it writes to /app/build are shipped onward
+# (see that workflow).
 # ================================================================
 
 FROM python:3.12-slim
@@ -22,45 +30,63 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 # ----------------------------------------------------------------
-# One corpus's TEI data, selected by the caller.
-#
-# CORPUS_SHA is not read directly (see the `echo` below) — it exists only
-# so its value becomes part of the RUN command's cache key: when the
-# corpus's HEAD SHA changes, Docker invalidates this layer and re-clones;
-# otherwise the cached clone is reused, same technique as Dockerfile.
+# Every corpus's TEI data -- all of it, in every shard's image, so any
+# shard can resolve a sibling/commentary link into any other corpus the
+# same way a full local checkout's combined CORPORA_DIR does. Each clone
+# gets its own SHA build-arg (not read directly -- see the `echo` in each
+# RUN below) purely so that corpus's HEAD SHA becomes part of that layer's
+# cache key: only the corpus that actually changed gets re-cloned, the
+# other four stay cached, same technique the old single-corpus clone used.
 # ----------------------------------------------------------------
 ARG CORPORA_DIR=/corpora
-ARG CORPUS_NAME
-ARG CORPUS_REPO_URL
-ARG CORPUS_BRANCH=editing
-ARG CORPUS_SHA=latest
+ARG GREEKLIT_SHA=latest
+ARG LATINLIT_SHA=latest
+ARG FIRST1KGREEK_SHA=latest
+ARG NDDLC_SHA=latest
+ARG GRCNEWXML_SHA=latest
 
-RUN test -n "$CORPUS_NAME" || (echo "CORPUS_NAME build-arg is required" >&2 && exit 1)
-RUN test -n "$CORPUS_REPO_URL" || (echo "CORPUS_REPO_URL build-arg is required" >&2 && exit 1)
+RUN echo "greekLit @ ${GREEKLIT_SHA}" && \
+    git clone --depth 1 --branch master \
+    https://github.com/PerseusDL/canonical-greekLit "${CORPORA_DIR}/greekLit"
 
-RUN echo "${CORPUS_NAME} @ ${CORPUS_SHA}" && \
-    git clone --depth 1 --branch "${CORPUS_BRANCH}" \
-    "${CORPUS_REPO_URL}" "${CORPORA_DIR}/${CORPUS_NAME}"
+RUN echo "latinLit @ ${LATINLIT_SHA}" && \
+    git clone --depth 1 --branch master \
+    https://github.com/PerseusDL/canonical-latinLit "${CORPORA_DIR}/latinLit"
 
-# Commentary linking (perseus_cts.commentary) reads canonical-pdlrefwk data
-# (public repo) regardless of which corpus is being built, so every
-# corpus-only image needs it too. Copied from the build context instead of
-# git-cloned here: the workflow fetches it once (see fetch-pdlrefwk job in
-# build-corpus.yml) and shares that single checkout across all three matrix
-# legs, rather than each of the three re-cloning it independently. A COPY's
-# cache key is the copied content's own checksum, so no SHA build-arg is
-# needed to invalidate it the way the git clone above needs CORPUS_SHA.
+RUN echo "First1KGreek @ ${FIRST1KGREEK_SHA}" && \
+    git clone --depth 1 --branch editing \
+    https://github.com/PerseusDLCode/First1KGreek "${CORPORA_DIR}/First1KGreek"
+
+RUN echo "Notre-Dame-Digitized-Latin-Collection @ ${NDDLC_SHA}" && \
+    git clone --depth 1 --branch main \
+    https://github.com/PerseusDLCode/Notre-Dame-Digitized-Latin-Collection \
+    "${CORPORA_DIR}/Notre-Dame-Digitized-Latin-Collection"
+
+RUN echo "grcnewxml @ ${GRCNEWXML_SHA}" && \
+    git clone --depth 1 --branch main \
+    https://github.com/gregorycrane/grcnewxml.git "${CORPORA_DIR}/grcnewxml"
+
+# canonical-pdlrefwk (public repo, commentary-linking data every shard
+# needs) is copied from the build context instead of git-cloned here: the
+# workflow fetches it once (see fetch-pdlrefwk job in build-corpus.yml) and
+# shares that single checkout across every matrix leg, rather than each
+# leg re-cloning it independently. A COPY's cache key is the copied
+# content's own checksum, so no SHA build-arg is needed to invalidate it
+# the way the git clones above need one.
 COPY canonical-pdlrefwk/ "${CORPORA_DIR}/canonical-pdlrefwk/"
 
 # Token sidecars (.tokens.json.zst) are generated by mvp-tokenization's
 # mvp-pipeline (fast tokenize-only pass over perseus-cts-compiled citation
-# chunks) and pulled as this corpus's mvp-tokens-<tag_name>:latest OCI
-# artifact into tokenized-pages/ in the build context (see
-# .github/workflows/build-corpus.yml's "Fetch tokens artifact" step) before
-# this Dockerfile runs. Baked into the image via COPY rather than bind-mounted
-# at `docker run` time, matching canonical-pdlrefwk's COPY above. The
-# directory may be empty if the tokenize-corpus workflow hasn't been run yet
-# for this corpus -- the reading view renders fine without it.
+# chunks) and pulled as OCI artifacts (one per corpus) into tokenized-pages/
+# in the build context (see .github/workflows/build-corpus.yml's "Fetch
+# tokens artifacts" step, which extracts all of them into the same
+# directory -- each corpus's archive already nests under its own corpus
+# segment, mirroring PROTO_DIR's layout, so they merge rather than
+# collide) before this Dockerfile runs. Baked into the image via COPY
+# rather than bind-mounted at `docker run` time, matching
+# canonical-pdlrefwk's COPY above. May be empty or partial if a given
+# corpus hasn't been through the tokenize-corpus workflow yet -- the
+# reading view renders fine without token sidecars.
 COPY tokenized-pages/ /app/tokens/
 
 WORKDIR /app
@@ -89,7 +115,7 @@ ENV MVP_TOKENS_DIR=/app/tokens
 # baked into the image, and optional at render time.
 ENV NEW_ALEXANDRIA_DIR=/app/new-alexandria
 
-# ENTRYPOINT (rather than CMD) so `docker run <image> --source-digest sha256:...`
+# ENTRYPOINT (rather than CMD) so `docker run <image> --source-digest sha256:... --shard-index N --shard-count M`
 # appends to `--mode corpus-only`, instead of replacing it outright.
 # MORPH_URL must still be passed via `-e` at runtime, same as Dockerfile.
 ENTRYPOINT ["uv", "run", "mvp-build", "--mode", "corpus-only"]

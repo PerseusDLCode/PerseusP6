@@ -1,27 +1,36 @@
 name: Build corpus artifacts
 
-# Builds each corpus's static pages independently and in parallel (see
-# Dockerfile.corpus / `mvp-build --mode corpus-only`), instead of the single
-# combined build in build-and-release.yml. Each matrix leg pushes its own
-# frozen-pages tarball + manifest.json as an OCI artifact to GHCR, tagged by
-# that corpus's HEAD SHA; build-global.yml consumes the manifests to
-# regenerate /, /collections/, /urn-index.json, /research/ once any corpus
-# changes.
+# Freezes the whole site's pages in N parallel shards (see Dockerfile.corpus
+# / `mvp-build --mode corpus-only --shard-index/--shard-count`), instead of
+# the single combined build in Dockerfile/build.yml. Every shard's
+# CORPORA_DIR contains *every* corpus (same as a full local checkout), so
+# cross-corpus sibling/commentary lookups (mvp.site.siblings) resolve
+# correctly no matter which shard a document's pages land in -- the shard
+# split only decides which slice of the full, already-cross-referenced URL
+# set each runner actually writes to disk (see build.py's URL-hash
+# sharding). Splitting by corpus instead of by URL was tried first and
+# reverted: these source repos don't partition cleanly by corpus (e.g.
+# First1KGreek declares both greekLit and hebrewlit URNs, grcnewxml
+# declares greekLit/itaLit/latinLit, canonical-pdlrefwk declares
+# greekLit/latinLit/pdlrefwk), so a corpus-keyed split either duplicated or
+# silently dropped pages depending on which corpus "won" a naming
+# collision. Each shard pushes its own frozen-pages tarball + manifest.json
+# as an OCI artifact to GHCR, tagged by a digest combining every corpus's
+# HEAD SHA (a change to any corpus can affect any shard's cross-references,
+# so all shards invalidate together); build-global.yml consumes the
+# manifests to regenerate /, /collections/, /urn-index.json, /research/
+# once any corpus changes.
 
 on:
   workflow_dispatch:
     inputs:
-      corpus:
-        description: >-
-          Build only this corpus (greekLit, latinLit, First1KGreek, Notre-Dame-Digitized-Latin-Collection, grcnewxml).
-          Leave blank to build all five.
-        required: false
       force:
         description: >-
-          Rebuild and push even if this corpus's SHA already has a pushed
-          artifact. The skip check only keys on the corpus's own git SHA,
-          not on mvp-build's code — so a build-image/app.py-only change
-          (no corpus content change) needs this to actually take effect.
+          Rebuild and push every shard even if the current combined corpus
+          digest already has pushed artifacts. The skip check only keys on
+          that combined digest, not on mvp-build's code — so a
+          build-image/app.py-only change (no corpus content change) needs
+          this to actually take effect.
         type: boolean
         default: false
   push:
@@ -36,11 +45,18 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # Number of parallel freeze shards (see matrix.shard below and build.py's
+  # --shard-count). Raising this trades more GHA runner-minutes for shorter
+  # wall-clock time per push; each shard still clones and catalogs every
+  # corpus, so total compute scales with the corpus count, not with this.
+  SHARD_COUNT: 5
+
 jobs:
   # Fetches canonical-pdlrefwk (public repo — commentary-linking data every
-  # corpus build needs, see Dockerfile.corpus) exactly once and shares it
-  # with all four matrix legs below via a build artifact, instead of each
-  # leg re-cloning the same repo independently.
+  # shard needs, see Dockerfile.corpus) exactly once and shares it with
+  # every matrix leg below via a build artifact, instead of each leg
+  # re-cloning the same repo independently.
   fetch-pdlrefwk:
     runs-on: ubuntu-latest
     outputs:
@@ -72,10 +88,10 @@ jobs:
 
   # Fetches New Alexandria Commentaries (curated Markdown from three
   # opencommentaries.org repos, see src/tools/fetch_new_alexandria.py)
-  # exactly once and shares it with all three matrix legs below, for the
-  # same reason as fetch-pdlrefwk above — only the greekLit leg actually
-  # renders a passage any of these commentaries cover, but every leg
-  # would otherwise redundantly hit GitHub for the same ~15 files.
+  # exactly once and shares it with every matrix leg below, for the same
+  # reason as fetch-pdlrefwk above — only pages covering a passage one of
+  # these commentaries annotates need it, but every shard would otherwise
+  # redundantly hit GitHub for the same ~15 files.
   fetch-new-alexandria:
     runs-on: ubuntu-latest
     steps:
@@ -101,8 +117,57 @@ jobs:
           path: new-alexandria
           retention-days: 1
 
+  # Resolves every corpus's HEAD SHA once and combines them into one
+  # digest, shared by every shard leg below. Splitting this out (rather
+  # than each shard resolving its own five SHAs) means all five shards
+  # agree on the same digest without racing independent `git ls-remote`
+  # calls against a moving target.
+  resolve-corpora-shas:
+    runs-on: ubuntu-latest
+    needs: [fetch-pdlrefwk]
+    outputs:
+      greeklit: ${{ steps.sha.outputs.greeklit }}
+      latinlit: ${{ steps.sha.outputs.latinlit }}
+      first1kgreek: ${{ steps.sha.outputs.first1kgreek }}
+      nddlc: ${{ steps.sha.outputs.nddlc }}
+      grcnewxml: ${{ steps.sha.outputs.grcnewxml }}
+      combined: ${{ steps.combined.outputs.digest }}
+    steps:
+      - name: Resolve each corpus's HEAD SHA
+        id: sha
+        run: |
+          declare -A repos=(
+            [greeklit]="https://github.com/PerseusDL/canonical-greekLit master"
+            [latinlit]="https://github.com/PerseusDL/canonical-latinLit master"
+            [first1kgreek]="https://github.com/PerseusDLCode/First1KGreek editing"
+            [nddlc]="https://github.com/PerseusDLCode/Notre-Dame-Digitized-Latin-Collection main"
+            [grcnewxml]="https://github.com/gregorycrane/grcnewxml.git main"
+          )
+          for name in "${!repos[@]}"; do
+            read -r url branch <<< "${repos[$name]}"
+            sha=$(git ls-remote "$url" "refs/heads/${branch}" | cut -f1)
+            if [ -z "$sha" ]; then
+              echo "Could not resolve HEAD SHA for ${url}@${branch}" >&2
+              exit 1
+            fi
+            echo "${name}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Compute combined digest
+        id: combined
+        run: |
+          digest=$(printf '%s' \
+            "${{ steps.sha.outputs.greeklit }}" \
+            "${{ steps.sha.outputs.latinlit }}" \
+            "${{ steps.sha.outputs.first1kgreek }}" \
+            "${{ steps.sha.outputs.nddlc }}" \
+            "${{ steps.sha.outputs.grcnewxml }}" \
+            "${{ needs.fetch-pdlrefwk.outputs.sha }}" \
+            | sha256sum | cut -d' ' -f1)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
   build:
-    needs: [fetch-pdlrefwk, fetch-new-alexandria]
+    needs: [fetch-pdlrefwk, fetch-new-alexandria, resolve-corpora-shas]
     runs-on: ubuntu-latest
     # Selects the GitHub Environment matching the triggering branch (dev or
     # main), so ${{ vars.MORPH_URL }} below resolves to that environment's
@@ -112,89 +177,25 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        include:
-          # `name` must stay case-sensitive — it's the literal corpus
-          # directory name app.py's _discover_corpora keys everything on
-          # (CORPUS_NAME build-arg, CORPORA_DIR/<name>, etc). `tag_name` is
-          # a separate lowercase-only variant for GHCR repository paths —
-          # both Docker and oras reject uppercase there ("invalid
-          # repository"), unlike image *tags*, which do allow it.
-          - name: greekLit
-            tag_name: greeklit
-            repo_url: https://github.com/PerseusDL/canonical-greekLit
-            branch: master
-          - name: latinLit
-            tag_name: latinlit
-            repo_url: https://github.com/PerseusDL/canonical-latinLit
-            branch: master
-          # NOTE: this corpus's own __cts__.xml files declare "hebrewLit"
-          # (see _CORPUS_LABELS/_CORPUS_REPO in app.py), but the directory
-          # name actually used at runtime — and so the "corpus" _discover_
-          # corpora keys everything on — is "First1KGreek", matching this
-          # repo's name. _CORPUS_LABELS has no entry for "First1KGreek", so
-          # today it displays as the raw string "First1KGreek" rather than
-          # a proper label. Pre-existing mismatch, not introduced by this
-          # workflow — flagging rather than silently picking a side.
-          - name: First1KGreek
-            tag_name: first1kgreek
-            repo_url: https://github.com/PerseusDLCode/First1KGreek
-            branch: editing
-          - name: Notre-Dame-Digitized-Latin-Collection
-            tag_name: nd-dlc
-            repo_url: https://github.com/PerseusDLCode/Notre-Dame-Digitized-Latin-Collection
-            branch: main
-          - name: grcnewxml
-            tag_name: grcnewxml
-            repo_url: https://github.com/gregorycrane/grcnewxml.git
-            branch: main
+        shard: [0, 1, 2, 3, 4]
     steps:
-      - name: Skip corpora not requested via workflow_dispatch
-        id: gate
-        run: |
-          if [ -n "${{ inputs.corpus }}" ] && [ "${{ inputs.corpus }}" != "${{ matrix.name }}" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v7
-        if: steps.gate.outputs.run == 'true'
         with:
           ref: ${{ github.ref_name }}
 
       - name: Download shared canonical-pdlrefwk artifact
-        if: steps.gate.outputs.run == 'true'
         uses: actions/download-artifact@v8
         with:
           name: canonical-pdlrefwk
           path: canonical-pdlrefwk
 
       - name: Download shared New Alexandria Commentaries artifact
-        if: steps.gate.outputs.run == 'true'
         uses: actions/download-artifact@v8
         with:
           name: new-alexandria
           path: new-alexandria
 
-      # ---------------------------------------------------------- #
-      # Resolve this corpus's HEAD SHA — doubles as the Docker
-      # cache-buster (see Dockerfile.corpus) and as the digest tagging
-      # this corpus's pushed artifact, so an unchanged corpus is a
-      # no-op rebuild (see the "Skip if already built" step).
-      # ---------------------------------------------------------- #
-      - name: Resolve corpus HEAD SHA
-        if: steps.gate.outputs.run == 'true'
-        id: sha
-        run: |
-          CORPUS_SHA=$(git ls-remote "${{ matrix.repo_url }}" "refs/heads/${{ matrix.branch }}" | cut -f1)
-          if [ -z "$CORPUS_SHA" ]; then
-            echo "Could not resolve HEAD SHA for ${{ matrix.repo_url }}@${{ matrix.branch }}" >&2
-            exit 1
-          fi
-          echo "corpus=${CORPUS_SHA}" >> "$GITHUB_OUTPUT"
-
       - name: Log in to GitHub Container Registry
-        if: steps.gate.outputs.run == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -202,19 +203,17 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install oras
-        if: steps.gate.outputs.run == 'true'
         uses: oras-project/setup-oras@v2
 
-      - name: Skip if this corpus's SHA is already built
-        if: steps.gate.outputs.run == 'true'
+      - name: Skip if this combined digest is already built
         id: skip
         run: |
           if [ "${{ inputs.force }}" = "true" ]; then
-            echo "force=true; rebuilding regardless of cached SHA."
+            echo "force=true; rebuilding regardless of cached digest."
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          TAG="ghcr.io/perseusdlcode/mvp-corpus-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}"
+          TAG="ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}:${{ needs.resolve-corpora-shas.outputs.combined }}"
           if oras manifest fetch "$TAG" >/dev/null 2>&1; then
             echo "Already built: $TAG"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -222,44 +221,56 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Pulled unconditionally as :latest (see mvp-tokenization's
-      # tokenize-corpus.yml, which is dispatched manually/separately from
-      # this workflow, not on every corpus SHA) -- not every corpus has been
-      # through that workflow yet, so a missing artifact just leaves
-      # tokenized-pages/ empty rather than failing the build; Dockerfile.
-      # corpus's COPY tolerates an empty directory, and the reading view
-      # renders fine without token sidecars.
-      - name: Fetch tokens artifact
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+      # Pulled unconditionally as :latest per corpus (see mvp-tokenization's
+      # tokenize-corpus.yml, dispatched manually/separately from this
+      # workflow, not on every corpus SHA) -- not every corpus has been
+      # through that workflow yet, so a missing artifact just leaves that
+      # corpus's slice of tokenized-pages/ empty rather than failing the
+      # build. Every shard needs every corpus's tokens now (any shard can
+      # contain any corpus's pages), so this loops over all five and
+      # extracts them into the same directory -- each corpus's archive
+      # nests under its own corpus segment (mirroring PROTO_DIR's layout),
+      # so they merge rather than collide. Dockerfile.corpus's COPY
+      # tolerates an empty/partial directory, and the reading view renders
+      # fine without token sidecars.
+      - name: Fetch tokens artifacts
+        if: steps.skip.outputs.skip != 'true'
         run: |
           mkdir -p tokenized-pages
-          if oras pull "ghcr.io/perseusdlcode/mvp-tokens-${{ matrix.tag_name }}:latest"; then
-            tar --zstd -xf tokens.tar.zst -C tokenized-pages
-            rm tokens.tar.zst
-          else
-            echo "No tokens artifact yet for ${{ matrix.name }}; building without token sidecars."
-          fi
+          for tag_name in greeklit latinlit first1kgreek nd-dlc grcnewxml; do
+            if oras pull "ghcr.io/perseusdlcode/mvp-tokens-${tag_name}:latest"; then
+              tar --zstd -xf tokens.tar.zst -C tokenized-pages
+              rm tokens.tar.zst
+            else
+              echo "No tokens artifact yet for ${tag_name}; building without its token sidecars."
+            fi
+          done
 
       - name: Set up Docker Buildx
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v4
 
-      - name: Build corpus builder image (not pushed — see file header)
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+      - name: Build shard builder image (not pushed — see file header)
+        if: steps.skip.outputs.skip != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.corpus
           push: false
           load: true
-          tags: mvp-corpus-builder:${{ matrix.name }}
+          tags: mvp-shard-builder:${{ matrix.shard }}
           build-args: |
-            CORPUS_NAME=${{ matrix.name }}
-            CORPUS_REPO_URL=${{ matrix.repo_url }}
-            CORPUS_BRANCH=${{ matrix.branch }}
-            CORPUS_SHA=${{ steps.sha.outputs.corpus }}
-          cache-from: type=gha,scope=corpus-${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=corpus-${{ matrix.name }}
+            GREEKLIT_SHA=${{ needs.resolve-corpora-shas.outputs.greeklit }}
+            LATINLIT_SHA=${{ needs.resolve-corpora-shas.outputs.latinlit }}
+            FIRST1KGREEK_SHA=${{ needs.resolve-corpora-shas.outputs.first1kgreek }}
+            NDDLC_SHA=${{ needs.resolve-corpora-shas.outputs.nddlc }}
+            GRCNEWXML_SHA=${{ needs.resolve-corpora-shas.outputs.grcnewxml }}
+          # Shared across every shard (not scoped per-shard): all five
+          # shards clone the identical set of corpora, so they should all
+          # hit the same Docker layer cache instead of each populating and
+          # reusing only its own copy.
+          cache-from: type=gha,scope=corpus-all
+          cache-to: type=gha,mode=max,scope=corpus-all
 
       # ---------------------------------------------------------- #
       # Run the freeze. manifest.json is written inside FREEZER_
@@ -269,54 +280,55 @@ jobs:
       # the repo under tokenized-pages/ and baked into the image by
       # Dockerfile.corpus.
       # ---------------------------------------------------------- #
-      - name: Run corpus-only build
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+      - name: Run sharded corpus-only build
+        if: steps.skip.outputs.skip != 'true'
         run: |
           mkdir -p "$PWD/out"
           docker run --rm \
             -e MORPH_URL="${{ vars.MORPH_URL }}" \
             -v "$PWD/out:/app/build" \
             -v "$PWD/new-alexandria:/app/new-alexandria:ro" \
-            mvp-corpus-builder:${{ matrix.name }} \
-            --source-digest "${{ steps.sha.outputs.corpus }}"
+            mvp-shard-builder:${{ matrix.shard }} \
+            --source-digest "${{ needs.resolve-corpora-shas.outputs.combined }}" \
+            --shard-index ${{ matrix.shard }} \
+            --shard-count ${{ env.SHARD_COUNT }}
 
       - name: Pull manifest.json out of the pages tree
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true'
         run: mv out/manifest.json manifest.json
 
       - name: Package frozen pages
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true'
         run: tar --zstd -cf pages.tar.zst -C out .
 
       # ---------------------------------------------------------- #
-      # Two artifacts per corpus: the (large) pages tarball, and the
+      # Two artifacts per shard: the (large) pages tarball, and the
       # (tiny) manifest, tagged separately so build-global.yml never
       # has to pull page content just to read a manifest.
       # ---------------------------------------------------------- #
       - name: Push pages artifact
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true'
         run: |
-          oras push "ghcr.io/perseusdlcode/mvp-corpus-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}" \
+          oras push "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}:${{ needs.resolve-corpora-shas.outputs.combined }}" \
             pages.tar.zst:application/vnd.perseus.mvp.pages
 
       - name: Push manifest artifact
-        if: steps.gate.outputs.run == 'true' && steps.skip.outputs.skip != 'true'
+        if: steps.skip.outputs.skip != 'true'
         run: |
-          oras push "ghcr.io/perseusdlcode/mvp-corpus-${{ matrix.tag_name }}-manifest:${{ steps.sha.outputs.corpus }}" \
+          oras push "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}-manifest:${{ needs.resolve-corpora-shas.outputs.combined }}" \
             manifest.json:application/vnd.perseus.mvp.manifest+json
 
       # ---------------------------------------------------------- #
       # Point this branch's alias (main -> latest = production,
-      # dev -> staging) at the corpus-SHA-tagged artifact. Runs
-      # whenever the SHA-tagged artifact exists in GHCR — whether it
-      # was just pushed above, or already existed from the other
-      # branch resolving the same corpus SHA (see the "Skip if
-      # already built" step) — so a skipped build still moves this
-      # branch's alias forward instead of leaving it stale.
+      # dev -> staging) at the digest-tagged artifact. Runs whenever
+      # the digest-tagged artifact exists in GHCR — whether it was
+      # just pushed above, or already existed from the other branch
+      # resolving the same combined digest (see the "Skip if already
+      # built" step) — so a skipped build still moves this branch's
+      # alias forward instead of leaving it stale.
       # ---------------------------------------------------------- #
       - name: Tag pages/manifest artifacts with this branch's alias
-        if: steps.gate.outputs.run == 'true'
         run: |
           ALIAS="${{ github.ref_name == 'main' && 'latest' || 'staging' }}"
-          oras tag "ghcr.io/perseusdlcode/mvp-corpus-${{ matrix.tag_name }}:${{ steps.sha.outputs.corpus }}" "$ALIAS"
-          oras tag "ghcr.io/perseusdlcode/mvp-corpus-${{ matrix.tag_name }}-manifest:${{ steps.sha.outputs.corpus }}" "$ALIAS"
+          oras tag "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}:${{ needs.resolve-corpora-shas.outputs.combined }}" "$ALIAS"
+          oras tag "ghcr.io/perseusdlcode/mvp-shard-${{ matrix.shard }}-manifest:${{ needs.resolve-corpora-shas.outputs.combined }}" "$ALIAS"
