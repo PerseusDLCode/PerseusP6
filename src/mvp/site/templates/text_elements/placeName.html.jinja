@@ -1,3 +1,7 @@
 {% from "components/macros.html.jinja" import render_children with context %}
-<a href="#{{ text_container.get("key", text_container.get("urn")) }}"
+{% if text_container.key %}
+<a href="//www.getty.edu/vow/TGNFullDisplay?find=&amp;place=&amp;nation=&amp;english=Y&amp;subjectid={{ text_container.key|replace("tgn,", "") }}"
    class="tei-placeName hover:font-extrabold">{{- render_children(text_container) -}}</a>
+{% else %}
+   <span class="tei-placeName">{{- render_children(text_container) -}}</span>
+{% endif %}
