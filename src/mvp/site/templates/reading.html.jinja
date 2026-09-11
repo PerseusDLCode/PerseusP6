@@ -12,8 +12,10 @@
 {% block header %}
     <header class="p-4">
         <div class="text-base-content w-full flex items-center gap-4">
-            <img class="w-24 h-24"
-                 src="{{ url_for('static', filename='images/perseus-running-man.png') }}" />
+            <a href="/" class="link" title="home">
+                <img class="w-24 h-24"
+                     src="{{ url_for('static', filename='images/perseus-running-man.png') }}" />
+            </a>
             <div>
                 <h1 class="text-xl font-bold">
                     {{ pub_info.author }} <em>{{ work_title }}</em>

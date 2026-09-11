@@ -18,8 +18,10 @@
         {% block header %}
             <header class="p-4">
                 <div class="text-base-content w-full flex items-center gap-4">
-                    <img class="w-24 h-24"
-                         src="{{ url_for('static', filename='images/perseus-running-man.png') }}" />
+                    <a href="/" title="home" class="link">
+                        <img class="w-24 h-24"
+                             src="{{ url_for('static', filename='images/perseus-running-man.png') }}" />
+                     </a>
                     <div>
                         <h1 class="text-xl font-bold small-caps text-shadow-sm">Perseus Digital Library</h1>
                         <h2 class="text-lg font-bold text-shadow-xs">Gregory R. Crane, Editor-in-Chief</h2>
